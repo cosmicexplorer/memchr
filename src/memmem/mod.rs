@@ -120,6 +120,39 @@ pub fn find_iter<'h, 'n, N: 'n + ?Sized + AsRef<[u8]>>(
     FindIter::new(haystack, Finder::new(needle))
 }
 
+/// Returns an iterator over all possibly-overlapping occurrences of a substring in
+/// a haystack.
+///
+/// # Complexity
+///
+/// This routine is guaranteed to have worst case linear time complexity
+/// with respect to both the needle and the haystack. That is, this runs
+/// in `O(needle.len() + haystack.len())` time.
+///
+/// This routine is also guaranteed to have worst case constant space
+/// complexity.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use memchr::memmem;
+///
+/// let haystack = b"sosososo";
+/// let matches: Vec<_> = memmem::find_iter(haystack, b"soso").collect();
+/// assert_eq!(matches, vec![0, 4]);
+/// let matches_overlapping: Vec<_> = memmem::find_overlapping_iter(haystack, b"soso").collect();
+/// assert_eq!(matches_overlapping, vec![0, 2, 4]);
+/// ```
+#[inline]
+pub fn find_overlapping_iter<'h, 'n, N: 'n + ?Sized + AsRef<[u8]>>(
+    haystack: &'h [u8],
+    needle: &'n N,
+) -> FindOverlappingIter<'h, 'n> {
+    FindOverlappingIter::new(haystack, needle.as_ref())
+}
+
 /// Returns a reverse iterator over all non-overlapping occurrences of a
 /// substring in a haystack.
 ///
@@ -301,6 +334,139 @@ impl<'h, 'n> Iterator for FindIter<'h, 'n> {
                 needle_len => (0, Some(haystack_len / needle_len)),
             },
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OverlappingFinder<'n> {
+    RabinKarp(rabinkarp::Finder, CowBytes<'n>),
+    MemMem(Finder<'n>, PrefilterState),
+}
+
+impl<'n> OverlappingFinder<'n> {
+    #[inline(always)]
+    pub fn for_haystack<'h, B: ?Sized + AsRef<[u8]>>(
+        haystack: &'h [u8],
+        needle: &'n B,
+    ) -> Self {
+        if haystack.len() < 64 {
+            Self::RabinKarp(
+                rabinkarp::Finder::new(needle.as_ref()),
+                CowBytes::new(needle),
+            )
+        } else {
+            Self::MemMem(Finder::new(needle), PrefilterState::new())
+        }
+    }
+
+    #[inline(always)]
+    pub fn find<'h>(&mut self, haystack: &'h [u8]) -> Option<usize> {
+        match self {
+            Self::RabinKarp(finder, needle) => finder.find(haystack, needle),
+            Self::MemMem(finder, ref mut prestate) => {
+                finder.searcher.find(prestate, haystack, finder.needle())
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn needle_len(&self) -> usize {
+        let needle = match self {
+            Self::RabinKarp(_, needle) => needle.as_slice(),
+            Self::MemMem(finder, _) => finder.needle(),
+        };
+        needle.len()
+    }
+
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_owned(self) -> OverlappingFinder<'static> {
+        match self {
+            Self::RabinKarp(finder, needle) => {
+                OverlappingFinder::RabinKarp(finder, needle.into_owned())
+            }
+            Self::MemMem(finder, prestate) => {
+                OverlappingFinder::MemMem(finder.into_owned(), prestate)
+            }
+        }
+    }
+}
+
+/// An iterator over overlapping substring matches.
+///
+/// Matches are reported by the byte offset at which they begin.
+///
+/// `'h` is the lifetime of the haystack while `'n` is the lifetime of the
+/// needle.
+#[derive(Debug, Clone)]
+pub struct FindOverlappingIter<'h, 'n> {
+    haystack: &'h [u8],
+    finder: OverlappingFinder<'n>,
+    pos: usize,
+}
+
+impl<'h, 'n> FindOverlappingIter<'h, 'n> {
+    #[inline(always)]
+    pub(crate) fn new(
+        haystack: &'h [u8],
+        needle: &'n [u8],
+    ) -> FindOverlappingIter<'h, 'n> {
+        let finder = OverlappingFinder::for_haystack(haystack, needle);
+        FindOverlappingIter { haystack, finder, pos: 0 }
+    }
+
+    /// Convert this iterator into its owned variant, such that it no longer
+    /// borrows the finder and needle.
+    ///
+    /// If this is already an owned iterator, then this is a no-op. Otherwise,
+    /// this copies the needle.
+    ///
+    /// This is only available when the `alloc` feature is enabled.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_owned(self) -> FindOverlappingIter<'h, 'static> {
+        FindOverlappingIter {
+            haystack: self.haystack,
+            finder: self.finder.into_owned(),
+            pos: self.pos,
+        }
+    }
+}
+
+impl<'h, 'n> Iterator for FindOverlappingIter<'h, 'n> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let haystack = self.haystack.get(self.pos..)?;
+        let idx = self.finder.find(haystack)?;
+
+        /* Iterate to the beginning of the match. */
+        let pos = self.pos + idx;
+        /* NB: Now go exactly one past, so we can find overlapping matches! */
+        self.pos = pos + 1;
+
+        Some(pos)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining_haystack_len =
+            match self.haystack.len().checked_sub(self.pos) {
+                None => return (0, Some(0)),
+                Some(haystack_len) => haystack_len,
+            };
+        let needle_len = self.finder.needle_len();
+        if needle_len == 0 {
+            // Empty needles always succeed and match at every point
+            // (including the very end)
+            return (
+                remaining_haystack_len.saturating_add(1),
+                remaining_haystack_len.checked_add(1),
+            );
+        }
+        /* Can match once if needle_len == haystack_len, then once further for each additional byte.
+        This is many more than the quotient which is used in FindIter, since it does not check for
+        overlapping matches. */
+        (0, Some(remaining_haystack_len.saturating_sub(needle_len - 1)))
     }
 }
 

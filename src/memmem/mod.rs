@@ -337,64 +337,389 @@ impl<'h, 'n> Iterator for FindIter<'h, 'n> {
     }
 }
 
+/// A single substring searcher fixed to a particular needle.
+///
+/// This type is similar to [`Finder`], but may also perform a Rabin-Karp search.
+///
+/// When the `std` feature is enabled, then this type has an `into_owned`
+/// version which permits building a `Finder` that is not connected to
+/// the lifetime of its needle.
 #[derive(Debug, Clone)]
-enum OverlappingFinder<'n> {
-    RabinKarp(rabinkarp::Finder, CowBytes<'n>),
-    MemMem(Finder<'n>, PrefilterState),
+pub enum CompiledFinder<'n> {
+    /// Uses Rabin-Karp method to search.
+    RabinKarp(CompiledRabinKarpFinder<'n>),
+    /// Uses [`Finder`] to search.
+    MemMem(Finder<'n>),
 }
 
-impl<'n> OverlappingFinder<'n> {
+impl<'n> CompiledFinder<'n> {
+    /// Create a new [`Self::MemMem`] finder for the given needle.
     #[inline(always)]
     pub fn for_needle_memmem<B: ?Sized + AsRef<[u8]>>(needle: &'n B) -> Self {
-        Self::MemMem(Finder::new(needle), PrefilterState::new())
+        Self::MemMem(Finder::new(needle))
     }
 
+    /// Create a new [`Self::RabinKarp`] finder for the given needle.
     #[inline(always)]
     pub fn for_needle_rabinkarp<B: ?Sized + AsRef<[u8]>>(
         needle: &'n B,
     ) -> Self {
-        Self::RabinKarp(
-            rabinkarp::Finder::new(needle.as_ref()),
-            CowBytes::new(needle),
-        )
+        Self::RabinKarp(CompiledRabinKarpFinder::for_needle(needle))
     }
 
+    /// Returns the needle that this finder searches for.
+    ///
+    /// Note that the lifetime of the needle returned is tied to the lifetime
+    /// of the finder, and may be shorter than the `'n` lifetime. Namely, a
+    /// finder's needle can be either borrowed or owned, so the lifetime of the
+    /// needle returned must necessarily be the shorter of the two.
+    #[inline(always)]
+    pub fn needle(&self) -> &[u8] {
+        match self {
+            Self::RabinKarp(finder) => finder.needle(),
+            Self::MemMem(finder) => finder.needle(),
+        }
+    }
+
+    /// Convert this finder into its borrowed variant.
+    ///
+    /// This is primarily useful if your finder is owned and you'd like to
+    /// store its borrowed variant in some intermediate data structure.
+    ///
+    /// Note that the lifetime parameter of the returned finder is tied to the
+    /// lifetime of `self`, and may be shorter than the `'n` lifetime of the
+    /// needle itself. Namely, a finder's needle can be either borrowed or
+    /// owned, so the lifetime of the needle returned must necessarily be the
+    /// shorter of the two.
+    #[inline]
+    pub fn as_ref(&self) -> CompiledFinder<'_> {
+        match self {
+            Self::RabinKarp(finder) => {
+                CompiledFinder::RabinKarp(finder.as_ref())
+            }
+            Self::MemMem(finder) => CompiledFinder::MemMem(finder.as_ref()),
+        }
+    }
+
+    /// Convert this finder into its owned variant, such that it no longer
+    /// borrows the needle.
+    ///
+    /// If this is already an owned finder, then this is a no-op. Otherwise,
+    /// this copies the needle.
+    ///
+    /// This is only available when the `alloc` feature is enabled.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_owned(self) -> CompiledFinder<'static> {
+        match self {
+            Self::RabinKarp(finder) => {
+                CompiledFinder::RabinKarp(finder.into_owned())
+            }
+            Self::MemMem(finder) => {
+                CompiledFinder::MemMem(finder.into_owned())
+            }
+        }
+    }
+
+    /// Initialize any mutable state needed for searching.
+    #[inline(always)]
+    pub fn prepare(self) -> PreparedFinder<'n> {
+        match self {
+            Self::RabinKarp(finder) => PreparedFinder::RabinKarp(finder),
+            Self::MemMem(finder) => PreparedFinder::MemMem(
+                PreparedMemMemFinder::prepare_finder_state(finder),
+            ),
+        }
+    }
+}
+
+/// A single substring Rabin-Karp searcher.
+#[derive(Debug, Clone)]
+pub struct CompiledRabinKarpFinder<'n> {
+    finder: rabinkarp::Finder,
+    needle: CowBytes<'n>,
+}
+
+impl<'n> CompiledRabinKarpFinder<'n> {
+    /// Create a new finder for the given needle.
+    #[inline(always)]
+    pub fn for_needle<B: ?Sized + AsRef<[u8]>>(needle: &'n B) -> Self {
+        Self {
+            finder: rabinkarp::Finder::new(needle.as_ref()),
+            needle: CowBytes::new(needle),
+        }
+    }
+
+    /// Returns the needle that this finder searches for.
+    ///
+    /// Note that the lifetime of the needle returned is tied to the lifetime
+    /// of the finder, and may be shorter than the `'n` lifetime. Namely, a
+    /// finder's needle can be either borrowed or owned, so the lifetime of the
+    /// needle returned must necessarily be the shorter of the two.
+    #[inline(always)]
+    pub fn needle(&self) -> &[u8] {
+        self.needle.as_slice()
+    }
+
+    /// Convert this finder into its borrowed variant.
+    ///
+    /// This is primarily useful if your finder is owned and you'd like to
+    /// store its borrowed variant in some intermediate data structure.
+    ///
+    /// Note that the lifetime parameter of the returned finder is tied to the
+    /// lifetime of `self`, and may be shorter than the `'n` lifetime of the
+    /// needle itself. Namely, a finder's needle can be either borrowed or
+    /// owned, so the lifetime of the needle returned must necessarily be the
+    /// shorter of the two.
+    #[inline]
+    pub fn as_ref(&self) -> CompiledRabinKarpFinder<'_> {
+        CompiledRabinKarpFinder {
+            finder: self.finder.clone(),
+            needle: CowBytes::new(self.needle.as_ref()),
+        }
+    }
+
+    /// Convert this finder into its owned variant, such that it no longer
+    /// borrows the needle.
+    ///
+    /// If this is already an owned finder, then this is a no-op. Otherwise,
+    /// this copies the needle.
+    ///
+    /// This is only available when the `alloc` feature is enabled.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_owned(self) -> CompiledRabinKarpFinder<'static> {
+        CompiledRabinKarpFinder {
+            finder: self.finder.clone(),
+            needle: self.needle.into_owned(),
+        }
+    }
+
+    /// Returns the index of the first occurrence of this needle in the given
+    /// haystack.
+    ///
+    /// # Complexity
+    ///
+    /// This routine is guaranteed to have worst case linear time complexity
+    /// with respect to both the needle and the haystack. That is, this runs
+    /// in `O(needle.len() + haystack.len())` time.
+    ///
+    /// This routine is also guaranteed to have worst case constant space
+    /// complexity.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use memchr::memmem::CompiledRabinKarpFinder as Finder;
+    ///
+    /// let haystack = b"foo bar baz";
+    /// assert_eq!(Some(0), Finder::for_needle("foo").find(haystack));
+    /// assert_eq!(Some(4), Finder::for_needle("bar").find(haystack));
+    /// assert_eq!(None, Finder::for_needle("quux").find(haystack));
+    /// ```
+    #[inline(always)]
+    pub fn find<'h>(&mut self, haystack: &'h [u8]) -> Option<usize> {
+        self.finder.find(haystack, self.needle())
+    }
+}
+
+/// A single substring [`Finder`] searcher along with mutable search state.
+#[derive(Debug, Clone)]
+pub struct PreparedMemMemFinder<'n> {
+    finder: Finder<'n>,
+    prestate: PrefilterState,
+}
+
+impl<'n> PreparedMemMemFinder<'n> {
+    /// Initialize mutable search state for the given `finder`.
+    #[inline(always)]
+    pub fn prepare_finder_state(finder: Finder<'n>) -> Self {
+        Self { finder, prestate: PrefilterState::new() }
+    }
+
+    /// Returns the needle that this finder searches for.
+    ///
+    /// Note that the lifetime of the needle returned is tied to the lifetime
+    /// of the finder, and may be shorter than the `'n` lifetime. Namely, a
+    /// finder's needle can be either borrowed or owned, so the lifetime of the
+    /// needle returned must necessarily be the shorter of the two.
+    #[inline(always)]
+    pub fn needle(&self) -> &[u8] {
+        self.finder.needle()
+    }
+
+    /// Convert this finder into its borrowed variant.
+    ///
+    /// This is primarily useful if your finder is owned and you'd like to
+    /// store its borrowed variant in some intermediate data structure.
+    ///
+    /// Note that the lifetime parameter of the returned finder is tied to the
+    /// lifetime of `self`, and may be shorter than the `'n` lifetime of the
+    /// needle itself. Namely, a finder's needle can be either borrowed or
+    /// owned, so the lifetime of the needle returned must necessarily be the
+    /// shorter of the two.
+    #[inline]
+    pub fn as_ref(&self) -> PreparedMemMemFinder<'_> {
+        PreparedMemMemFinder {
+            finder: self.finder.as_ref(),
+            prestate: self.prestate.clone(),
+        }
+    }
+
+    /// Convert this finder into its owned variant, such that it no longer
+    /// borrows the needle.
+    ///
+    /// If this is already an owned finder, then this is a no-op. Otherwise,
+    /// this copies the needle.
+    ///
+    /// This is only available when the `alloc` feature is enabled.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_owned(self) -> PreparedMemMemFinder<'static> {
+        PreparedMemMemFinder {
+            finder: self.finder.into_owned(),
+            prestate: self.prestate.clone(),
+        }
+    }
+
+    /// Returns the index of the first occurrence of this needle in the given
+    /// haystack.
+    ///
+    /// # Complexity
+    ///
+    /// This routine is guaranteed to have worst case linear time complexity
+    /// with respect to both the needle and the haystack. That is, this runs
+    /// in `O(needle.len() + haystack.len())` time.
+    ///
+    /// This routine is also guaranteed to have worst case constant space
+    /// complexity.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use memchr::memmem::{Finder, PreparedMemMemFinder as P};
+    ///
+    /// let haystack = b"foo bar baz";
+    /// assert_eq!(Some(0), P::prepare_finder_state(Finder::new("foo")).find(haystack));
+    /// assert_eq!(Some(4), P::prepare_finder_state(Finder::new("bar")).find(haystack));
+    /// assert_eq!(None, P::prepare_finder_state(Finder::new("quux")).find(haystack));
+    /// ```
+    #[inline(always)]
+    pub fn find<'h>(&mut self, haystack: &'h [u8]) -> Option<usize> {
+        self.finder.searcher.find(
+            &mut self.prestate,
+            haystack,
+            self.finder.needle(),
+        )
+    }
+}
+
+/// A single substring searcher fixed to a particular needle along with mutable search state.
+///
+/// This type should be generated by invoking [`CompiledFinder::prepare()`].
+///
+/// When the `std` feature is enabled, then this type has an `into_owned`
+/// version which permits building a `Finder` that is not connected to
+/// the lifetime of its needle.
+#[derive(Debug, Clone)]
+pub enum PreparedFinder<'n> {
+    /// Uses Rabin-Karp method to search.
+    RabinKarp(CompiledRabinKarpFinder<'n>),
+    /// Uses [`Finder`] to search.
+    MemMem(PreparedMemMemFinder<'n>),
+}
+
+impl<'n> PreparedFinder<'n> {
+    /// Returns the needle that this finder searches for.
+    ///
+    /// Note that the lifetime of the needle returned is tied to the lifetime
+    /// of the finder, and may be shorter than the `'n` lifetime. Namely, a
+    /// finder's needle can be either borrowed or owned, so the lifetime of the
+    /// needle returned must necessarily be the shorter of the two.
+    #[inline(always)]
+    pub fn needle(&self) -> &[u8] {
+        match self {
+            Self::RabinKarp(finder) => finder.needle(),
+            Self::MemMem(finder) => finder.needle(),
+        }
+    }
+
+    /// Convert this finder into its borrowed variant.
+    ///
+    /// This is primarily useful if your finder is owned and you'd like to
+    /// store its borrowed variant in some intermediate data structure.
+    ///
+    /// Note that the lifetime parameter of the returned finder is tied to the
+    /// lifetime of `self`, and may be shorter than the `'n` lifetime of the
+    /// needle itself. Namely, a finder's needle can be either borrowed or
+    /// owned, so the lifetime of the needle returned must necessarily be the
+    /// shorter of the two.
+    #[inline]
+    pub fn as_ref(&self) -> PreparedFinder<'_> {
+        match self {
+            Self::RabinKarp(finder) => {
+                PreparedFinder::RabinKarp(finder.as_ref())
+            }
+            Self::MemMem(finder) => PreparedFinder::MemMem(finder.as_ref()),
+        }
+    }
+
+    /// Convert this finder into its owned variant, such that it no longer
+    /// borrows the needle.
+    ///
+    /// If this is already an owned finder, then this is a no-op. Otherwise,
+    /// this copies the needle.
+    ///
+    /// This is only available when the `alloc` feature is enabled.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn into_owned(self) -> PreparedFinder<'static> {
+        match self {
+            Self::RabinKarp(finder) => {
+                PreparedFinder::RabinKarp(finder.into_owned())
+            }
+            Self::MemMem(finder) => {
+                PreparedFinder::MemMem(finder.into_owned())
+            }
+        }
+    }
+
+    /// Returns the index of the first occurrence of this needle in the given
+    /// haystack.
+    ///
+    /// # Complexity
+    ///
+    /// This routine is guaranteed to have worst case linear time complexity
+    /// with respect to both the needle and the haystack. That is, this runs
+    /// in `O(needle.len() + haystack.len())` time.
+    ///
+    /// This routine is also guaranteed to have worst case constant space
+    /// complexity.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use memchr::memmem::CompiledFinder as C;
+    ///
+    /// let haystack = b"foo bar baz";
+    /// assert_eq!(Some(0), C::for_needle_memmem("foo").prepare().find(haystack));
+    /// assert_eq!(Some(0), C::for_needle_rabinkarp("foo").prepare().find(haystack));
+    /// assert_eq!(Some(4), C::for_needle_memmem("bar").prepare().find(haystack));
+    /// assert_eq!(Some(4), C::for_needle_rabinkarp("bar").prepare().find(haystack));
+    /// assert_eq!(None, C::for_needle_memmem("quux").prepare().find(haystack));
+    /// assert_eq!(None, C::for_needle_rabinkarp("quux").prepare().find(haystack));
+    /// ```
     #[inline(always)]
     pub fn find<'h>(&mut self, haystack: &'h [u8]) -> Option<usize> {
         match self {
-            Self::RabinKarp(finder, needle) => finder.find(haystack, needle),
-            Self::MemMem(finder, ref mut prestate) => {
-                finder.searcher.find(prestate, haystack, finder.needle())
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn needle<'a>(&'a self) -> &'n [u8]
-    where
-        'a: 'n,
-    {
-        match self {
-            Self::RabinKarp(_, needle) => needle.as_slice(),
-            Self::MemMem(finder, _) => finder.needle(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn needle_len(&self) -> usize {
-        self.needle().len()
-    }
-
-    #[cfg(feature = "alloc")]
-    #[inline]
-    pub fn into_owned(self) -> OverlappingFinder<'static> {
-        match self {
-            Self::RabinKarp(finder, needle) => {
-                OverlappingFinder::RabinKarp(finder, needle.into_owned())
-            }
-            Self::MemMem(finder, prestate) => {
-                OverlappingFinder::MemMem(finder.into_owned(), prestate)
-            }
+            Self::RabinKarp(finder) => finder.find(haystack),
+            Self::MemMem(finder) => finder.find(haystack),
         }
     }
 }
@@ -408,7 +733,7 @@ impl<'n> OverlappingFinder<'n> {
 #[derive(Debug, Clone)]
 pub struct FindOverlappingIter<'h, 'n> {
     haystack: &'h [u8],
-    finder: OverlappingFinder<'n>,
+    finder: PreparedFinder<'n>,
     pos: usize,
 }
 
@@ -419,10 +744,11 @@ impl<'h, 'n> FindOverlappingIter<'h, 'n> {
         needle: &'n B,
     ) -> FindOverlappingIter<'h, 'n> {
         let finder = if haystack.len() < 64 {
-            OverlappingFinder::for_needle_rabinkarp(needle)
+            CompiledFinder::for_needle_rabinkarp(needle)
         } else {
-            OverlappingFinder::for_needle_memmem(needle)
+            CompiledFinder::for_needle_memmem(needle)
         };
+        let finder = finder.prepare();
         FindOverlappingIter { haystack, finder, pos: 0 }
     }
 
@@ -465,7 +791,7 @@ impl<'h, 'n> Iterator for FindOverlappingIter<'h, 'n> {
                 None => return (0, Some(0)),
                 Some(haystack_len) => haystack_len,
             };
-        let needle_len = self.finder.needle_len();
+        let needle_len = self.finder.needle().len();
         if needle_len == 0 {
             // Empty needles always succeed and match at every point
             // (including the very end)

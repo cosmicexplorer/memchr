@@ -345,18 +345,18 @@ enum OverlappingFinder<'n> {
 
 impl<'n> OverlappingFinder<'n> {
     #[inline(always)]
-    pub fn for_haystack<'h, B: ?Sized + AsRef<[u8]>>(
-        haystack: &'h [u8],
+    pub fn for_needle_memmem<B: ?Sized + AsRef<[u8]>>(needle: &'n B) -> Self {
+        Self::MemMem(Finder::new(needle), PrefilterState::new())
+    }
+
+    #[inline(always)]
+    pub fn for_needle_rabinkarp<B: ?Sized + AsRef<[u8]>>(
         needle: &'n B,
     ) -> Self {
-        if haystack.len() < 64 {
-            Self::RabinKarp(
-                rabinkarp::Finder::new(needle.as_ref()),
-                CowBytes::new(needle),
-            )
-        } else {
-            Self::MemMem(Finder::new(needle), PrefilterState::new())
-        }
+        Self::RabinKarp(
+            rabinkarp::Finder::new(needle.as_ref()),
+            CowBytes::new(needle),
+        )
     }
 
     #[inline(always)]
@@ -370,12 +370,19 @@ impl<'n> OverlappingFinder<'n> {
     }
 
     #[inline(always)]
-    pub fn needle_len(&self) -> usize {
-        let needle = match self {
+    pub fn needle<'a>(&'a self) -> &'n [u8]
+    where
+        'a: 'n,
+    {
+        match self {
             Self::RabinKarp(_, needle) => needle.as_slice(),
             Self::MemMem(finder, _) => finder.needle(),
-        };
-        needle.len()
+        }
+    }
+
+    #[inline(always)]
+    pub fn needle_len(&self) -> usize {
+        self.needle().len()
     }
 
     #[cfg(feature = "alloc")]
@@ -407,11 +414,15 @@ pub struct FindOverlappingIter<'h, 'n> {
 
 impl<'h, 'n> FindOverlappingIter<'h, 'n> {
     #[inline(always)]
-    pub(crate) fn new(
+    pub(crate) fn new<B: ?Sized + AsRef<[u8]>>(
         haystack: &'h [u8],
-        needle: &'n [u8],
+        needle: &'n B,
     ) -> FindOverlappingIter<'h, 'n> {
-        let finder = OverlappingFinder::for_haystack(haystack, needle);
+        let finder = if haystack.len() < 64 {
+            OverlappingFinder::for_needle_rabinkarp(needle)
+        } else {
+            OverlappingFinder::for_needle_memmem(needle)
+        };
         FindOverlappingIter { haystack, finder, pos: 0 }
     }
 

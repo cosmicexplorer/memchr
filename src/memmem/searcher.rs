@@ -207,7 +207,7 @@ impl Searcher {
     /// Inlining this can lead to big wins for latency, and #[inline] doesn't
     /// seem to be enough in some cases.
     #[inline(always)]
-    pub(crate) fn find(
+    pub fn find(
         &self,
         prestate: &mut PrefilterState,
         haystack: &[u8],
@@ -875,7 +875,7 @@ unsafe fn prefilter_kind_neon(
 /// created from a `Freqy`. e.g., An inert `Freqy` will produce an inert
 /// `PrefilterState`.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PrefilterState {
+pub struct PrefilterState {
     /// The number of skips that has been executed. This is always 1 greater
     /// than the actual number of skips. The special sentinel value of 0
     /// indicates that the prefilter is inert. This is useful to avoid

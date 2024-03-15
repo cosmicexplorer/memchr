@@ -66,7 +66,9 @@ assert_eq!(None, finder.find(b"quux baz bar"));
 ```
 */
 
-pub use crate::memmem::searcher::PrefilterConfig as Prefilter;
+pub use crate::memmem::searcher::{
+    PrefilterConfig as Prefilter, PrefilterState,
+};
 
 // This is exported here for use in the crate::arch::all::twoway
 // implementation. This is essentially an abstraction breaker. Namely, the
@@ -81,7 +83,7 @@ use crate::{
         rabinkarp,
     },
     cow::CowBytes,
-    memmem::searcher::{PrefilterState, Searcher, SearcherRev},
+    memmem::searcher::{Searcher, SearcherRev},
 };
 
 mod searcher;
@@ -520,7 +522,7 @@ impl<'n> CompiledRabinKarpFinder<'n> {
     /// assert_eq!(None, Finder::for_needle("quux").find(haystack));
     /// ```
     #[inline(always)]
-    pub fn find<'h>(&mut self, haystack: &'h [u8]) -> Option<usize> {
+    pub fn find<'h>(&self, haystack: &'h [u8]) -> Option<usize> {
         self.finder.find(haystack, self.needle())
     }
 }
@@ -925,6 +927,40 @@ impl<'n> Finder<'n> {
     /// ```
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
+        let mut prestate = PrefilterState::new();
+        self.find_state(&mut prestate, haystack)
+    }
+
+    /// Returns the index of the first occurrence of this needle in the given
+    /// haystack.
+    ///
+    /// # Complexity
+    ///
+    /// This routine is guaranteed to have worst case linear time complexity
+    /// with respect to both the needle and the haystack. That is, this runs
+    /// in `O(needle.len() + haystack.len())` time.
+    ///
+    /// This routine is also guaranteed to have worst case constant space
+    /// complexity.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use memchr::memmem::Finder;
+    ///
+    /// let haystack = b"foo bar baz";
+    /// assert_eq!(Some(0), Finder::new("foo").find(haystack));
+    /// assert_eq!(Some(4), Finder::new("bar").find(haystack));
+    /// assert_eq!(None, Finder::new("quux").find(haystack));
+    /// ```
+    #[inline]
+    pub fn find_state(
+        &self,
+        prestate: &mut PrefilterState,
+        haystack: &[u8],
+    ) -> Option<usize> {
         let mut prestate = PrefilterState::new();
         let needle = self.needle.as_slice();
         self.searcher.find(&mut prestate, haystack, needle)

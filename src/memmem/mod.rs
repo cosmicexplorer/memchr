@@ -961,9 +961,8 @@ impl<'n> Finder<'n> {
         prestate: &mut PrefilterState,
         haystack: &[u8],
     ) -> Option<usize> {
-        let mut prestate = PrefilterState::new();
         let needle = self.needle.as_slice();
-        self.searcher.find(&mut prestate, haystack, needle)
+        self.searcher.find(prestate, haystack, needle)
     }
 
     /// Returns an iterator over all occurrences of a substring in a haystack.

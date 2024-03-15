@@ -902,7 +902,7 @@ impl PrefilterState {
 
     /// Create a fresh prefilter state.
     #[inline]
-    pub(crate) fn new() -> PrefilterState {
+    pub fn new() -> PrefilterState {
         PrefilterState { skips: 1, skipped: 0 }
     }
 
